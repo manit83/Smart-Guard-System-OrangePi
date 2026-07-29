@@ -1,0 +1,44 @@
+[Unit]
+Description=Smart Guard Adaptive Thermal Manager
+Documentation=file:/opt/smart-guard/README.md
+Wants=network-online.target
+Requires=smart-guard-vision.service
+After=network-online.target smart-guard-vision.service
+
+[Service]
+Type=simple
+User=root
+Group=smartguard
+WorkingDirectory=/opt/smart-guard
+EnvironmentFile=/etc/smart-guard/config.env
+ExecStartPre=/opt/smart-guard/bin/smart-guard-thermal-manager --check-config
+ExecStart=/opt/smart-guard/bin/smart-guard-thermal-manager
+
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+
+StateDirectory=smart-guard
+StateDirectoryMode=0770
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/smart-guard
+ReadWritePaths=/run/smart-guard /var/lib/smart-guard
+
+[Install]
+WantedBy=multi-user.target

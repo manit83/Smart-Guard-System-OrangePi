@@ -1,0 +1,335 @@
+openapi: 3.0.3
+info:
+  title: Smart Guard API
+  version: 2.0.0
+  description: |
+    HTTPS API implemented by the Smart Guard C web server.
+    Use `frames=1` when testing the MJPEG stream inside Swagger UI.
+servers:
+  - url: /
+tags:
+  - name: Required API
+    description: Endpoints required by the final project specification
+  - name: Guard and history
+    description: Final-section security and black-box endpoints
+paths:
+  /api/v1/stream:
+    get:
+      tags: [Required API]
+      summary: Read the live annotated MJPEG stream
+      description: |
+        Without `frames`, the response is a continuous MJPEG stream.
+        In Swagger UI set `frames` to 1-5 so the request finishes.
+      parameters:
+        - name: frames
+          in: query
+          required: false
+          description: Optional finite frame count for Swagger and automated tests
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+          example: 1
+      responses:
+        "200":
+          description: MJPEG image stream
+          content:
+            multipart/x-mixed-replace:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          description: A fresh camera frame is not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/persons:
+    get:
+      tags: [Required API]
+      summary: Read the current detected-person count
+      responses:
+        "200":
+          description: Current count and vision timestamp
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Persons"
+              example:
+                persons: 1
+                timestamp: "2026-07-29T15:30:20+04:00"
+        "503":
+          description: Vision state is unavailable or stale
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/telemetry:
+    get:
+      tags: [Required API]
+      summary: Read live CPU, memory, and board telemetry
+      description: |
+        Temperature and memory are read directly in C from `/sys` and `/proc`.
+        No shell command is used to collect these values.
+      responses:
+        "200":
+          description: Current board telemetry and dashboard state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Telemetry"
+  /api/v1/command:
+    post:
+      tags: [Required API]
+      summary: Queue an allowlisted board command
+      description: |
+        The request is validated in C and sent to the restricted command
+        service. Input is never passed to a shell. Execute reboot last because
+        the board and Swagger UI will become temporarily unavailable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommandRequest"
+            example:
+              cmd: reboot
+      responses:
+        "202":
+          description: Command accepted by the C API
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandAccepted"
+              example:
+                status: accepted
+                cmd: reboot
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: The reboot command is disabled in configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: The command is syntactically valid but unsupported
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: The command runner queue is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/history:
+    get:
+      tags: [Required API, Guard and history]
+      summary: Read the SQLite circular detection history
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 5
+      responses:
+        "200":
+          description: Lifetime totals and newest stored events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/History"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          description: SQLite history is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/guard-mode:
+    get:
+      tags: [Guard and history]
+      summary: Read persistent guard mode
+      responses:
+        "200":
+          description: Current guard mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuardMode"
+    post:
+      tags: [Guard and history]
+      summary: Enable or disable guard mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+            example:
+              enabled: true
+      responses:
+        "200":
+          description: Updated guard mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuardMode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+components:
+  responses:
+    BadRequest:
+      description: Invalid request body or query parameter
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    Persons:
+      type: object
+      required: [persons, timestamp]
+      properties:
+        persons:
+          type: integer
+          minimum: 0
+        timestamp:
+          type: string
+          format: date-time
+    Telemetry:
+      type: object
+      required:
+        - student_name
+        - student_id
+        - timestamp
+        - telemetry_interval_sec
+        - temperature_c
+        - memory_available_mb
+        - cpu_percent
+        - uptime_seconds
+        - persons
+        - guard_enabled
+        - vision_online
+        - frame_available
+      properties:
+        student_name:
+          type: string
+        student_id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        telemetry_interval_sec:
+          type: integer
+          minimum: 1
+        temperature_c:
+          type: number
+          format: double
+          nullable: true
+        memory_available_mb:
+          type: number
+          format: double
+          nullable: true
+        cpu_percent:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+          nullable: true
+        uptime_seconds:
+          type: number
+          format: double
+          nullable: true
+        persons:
+          type: integer
+          minimum: 0
+        guard_enabled:
+          type: boolean
+        vision_online:
+          type: boolean
+        frame_available:
+          type: boolean
+    CommandRequest:
+      type: object
+      required: [cmd]
+      additionalProperties: false
+      properties:
+        cmd:
+          type: string
+          enum: [reboot]
+    CommandAccepted:
+      type: object
+      required: [status, cmd]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+        cmd:
+          type: string
+          enum: [reboot]
+    GuardMode:
+      type: object
+      required: [enabled, mode]
+      properties:
+        enabled:
+          type: boolean
+        mode:
+          type: string
+          enum: [armed, disarmed]
+    History:
+      type: object
+      required:
+        - total_detection_events
+        - total_humans_detected
+        - stored_records
+        - capacity
+        - events
+      properties:
+        total_detection_events:
+          type: integer
+          format: int64
+        total_humans_detected:
+          type: integer
+          format: int64
+        stored_records:
+          type: integer
+          format: int64
+        capacity:
+          type: integer
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/Detection"
+    Detection:
+      type: object
+      required: [sequence, timestamp, persons, frame_path]
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        timestamp:
+          type: string
+          format: date-time
+        persons:
+          type: integer
+          minimum: 1
+        frame_path:
+          type: string

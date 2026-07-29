@@ -1,0 +1,30 @@
+[Unit]
+Description=Smart Guard Camera Source Readiness
+Wants=network-online.target
+After=systemd-udevd.service network-online.target
+
+[Service]
+Type=oneshot
+User=smartguard
+Group=smartguard
+SupplementaryGroups=video
+EnvironmentFile=/etc/smart-guard/config.env
+ExecStart=/opt/smart-guard/bin/camera_ready.sh
+RemainAfterExit=yes
+TimeoutStartSec=45s
+UMask=0027
+PrivateTmp=true
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

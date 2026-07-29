@@ -1,0 +1,47 @@
+[Unit]
+Description=Smart Guard OpenCV Face Detection
+Documentation=file:/opt/smart-guard/README.md
+Requires=smart-guard-camera.service
+After=smart-guard-camera.service
+
+[Service]
+PrivateDevices=false
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+Type=notify
+NotifyAccess=main
+User=smartguard
+Group=smartguard
+SupplementaryGroups=video
+EnvironmentFile=/etc/smart-guard/config.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/smart-guard/bin/vision_start.sh
+
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=45s
+TimeoutStopSec=10s
+WatchdogSec=30s
+
+RuntimeDirectory=smart-guard
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/smart-guard
+
+[Install]
+WantedBy=multi-user.target

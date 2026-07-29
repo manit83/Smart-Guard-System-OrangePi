@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#000000">
+  <title>Smart Guard</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1 class="screen-reader-only">Smart Guard</h1>
+      <div class="ascii-logo" aria-hidden="true">
+        <pre> .d8888b.  888b     d888        d8888 8888888b. 88888888888       .d8888b.  888     888       d8888 8888888b.  8888888b.
+d88P  Y88b 8888b   d8888       d88888 888   Y88b    888          d88P  Y88b 888     888      d88888 888   Y88b 888  "Y88b
+Y88b.      88888b.d88888      d88P888 888    888    888          888    888 888     888     d88P888 888    888 888    888
+ "Y888b.   888Y88888P888     d88P 888 888   d88P    888          888        888     888    d88P 888 888   d88P 888    888
+    "Y88b. 888 Y888P 888    d88P  888 8888888P"     888          888  88888 888     888   d88P  888 8888888P"  888    888
+      "888 888  Y8P  888   d88P   888 888 T88b      888   888888 888    888 888     888  d88P   888 888 T88b   888    888
+Y88b  d88P 888   "   888  d8888888888 888  T88b     888          Y88b  d88P Y88b. .d88P d8888888888 888  T88b  888  .d88P
+ "Y8888P"  888       888 d88P     888 888   T88b    888           "Y8888P88  "Y88888P" d88P     888 888   T88b 8888888P"</pre>
+      </div>
+      <p class="student">
+        <span id="student-name">Student Name</span>
+        <span>—</span>
+        <span id="student-id">Student ID</span>
+      </p>
+    </header>
+
+    <section class="camera-section">
+      <div class="section-heading">
+        <h2>Live Camera</h2>
+        <p id="stream-status">
+          <span class="status-dot"></span>
+          <span id="stream-status-text">Waiting for a frame</span>
+        </p>
+      </div>
+
+      <div class="camera-view">
+        <img id="camera-frame" alt="Live camera feed" hidden>
+        <div id="waiting-state">
+          <pre aria-hidden="true">
+   .--------.
+  /  CAMERA  \
+ |    [ ]     |
+  \__________/
+          </pre>
+          <p>Waiting for the USB camera</p>
+          <small>The camera service has not received a frame yet.</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="quick-info">
+      <div>
+        <p class="item-title">Person Count</p>
+        <p class="big-number">
+          <span id="person-count">0</span>
+          <small>people</small>
+        </p>
+        <p id="vision-state" class="note">
+          The face detection service is not available.
+        </p>
+      </div>
+
+      <div>
+        <p class="item-title">System Time</p>
+        <time id="system-time">--:--:--</time>
+        <p id="system-date" class="note">----/--/--</p>
+      </div>
+    </section>
+
+    <section class="guard-panel" aria-labelledby="guard-title">
+      <div>
+        <h2 id="guard-title">Guard Mode</h2>
+        <p id="guard-description" class="screen-reader-only">
+          Person email and emergency MQTT alarms are disabled.
+        </p>
+      </div>
+      <div class="guard-action">
+        <strong id="guard-state">DISABLED</strong>
+        <button id="guard-toggle" type="button" aria-pressed="false">
+          Enable Guard Mode
+        </button>
+        <small id="guard-message" role="status" hidden></small>
+      </div>
+    </section>
+
+    <section class="history-panel" aria-labelledby="history-title">
+      <div class="section-heading">
+        <h2 id="history-title">Detection History</h2>
+        <p class="history-total">
+          Total events: <strong id="history-total">0</strong>
+        </p>
+      </div>
+      <ol id="history-list">
+        <li>No detections have been recorded.</li>
+      </ol>
+    </section>
+
+    <section class="metrics" aria-label="System status">
+      <div>
+        <p>CPU Temperature</p>
+        <strong><span id="temperature">--</span> <small>°C</small></strong>
+      </div>
+      <div>
+        <p>Available Memory</p>
+        <strong><span id="memory">--</span> <small>MB</small></strong>
+      </div>
+      <div>
+        <p>CPU Usage</p>
+        <strong><span id="cpu">--</span> <small>%</small></strong>
+      </div>
+    </section>
+
+    <footer>
+      <span>HTTPS enabled</span>
+      <a href="/docs/">Swagger API</a>
+      <span>Last update: <b id="last-update">---</b></span>
+      <span>Uptime: <b id="uptime">---</b></span>
+    </footer>
+  </main>
+
+  <noscript>JavaScript must be enabled to display live data.</noscript>
+</body>
+</html>

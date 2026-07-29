@@ -1,0 +1,32 @@
+# Local configuration and secrets
+config/config.env
+config/config.env.*
+.env
+.env.*
+!.env.example
+secrets/
+.ssh/
+*.key
+*.pem
+id_ed25519
+id_ed25519.pub
+id_rsa
+id_rsa.pub
+
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3
+*.log
+captures/
+snapshots/
+
+# Build and cache
+build/
+*.o
+__pycache__/
+*.py[cod]
+
+# Backups
+*.bak
+*~
