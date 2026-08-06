@@ -3,7 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_SOURCE="${PROJECT_DIR}/config/config.env"
+CONFIG_TEMPLATE="${PROJECT_DIR}/config/config.example.env"
+DEFAULT_CONFIG_SOURCE="${PROJECT_DIR}/config/config.env"
+CONFIG_SOURCE="${DEFAULT_CONFIG_SOURCE}"
+CONFIG_SOURCE_EXPLICIT=0
 START_SERVICES=1
 INSTALL_DEPENDENCIES=1
 
@@ -18,8 +21,9 @@ Options:
   --skip-deps    Do not run apt-get; require dependencies to be installed.
   -h, --help     Show this help.
 
-If config/config.env is absent but /etc/smart-guard/config.env exists, the
-installed configuration is preserved and reused.
+The installed configuration is generated from config/config.example.env.
+Values already set in config/config.env (or the installed configuration) are
+carried forward, while newly added settings receive the template defaults.
 EOF
 }
 
@@ -28,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --config)
       [[ $# -ge 2 ]] || { usage >&2; exit 2; }
       CONFIG_SOURCE="$(realpath "$2")"
+      CONFIG_SOURCE_EXPLICIT=1
       shift 2
       ;;
     --no-start)
@@ -55,23 +60,77 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
+if [[ ! -r "${CONFIG_TEMPLATE}" ]]; then
+  echo "Configuration template not found: ${CONFIG_TEMPLATE}" >&2
+  exit 1
+fi
+
 if [[ ! -r "${CONFIG_SOURCE}" &&
-      -r /etc/smart-guard/config.env &&
-      "${CONFIG_SOURCE}" == "${PROJECT_DIR}/config/config.env" ]]; then
+      "${CONFIG_SOURCE_EXPLICIT}" -eq 0 &&
+      -r /etc/smart-guard/config.env ]]; then
   CONFIG_SOURCE=/etc/smart-guard/config.env
 fi
 
-if [[ ! -r "${CONFIG_SOURCE}" ]]; then
-  cat >&2 <<EOF
-Configuration file not found: ${CONFIG_SOURCE}
+if [[ ! -r "${CONFIG_SOURCE}" &&
+      "${CONFIG_SOURCE_EXPLICIT}" -eq 0 ]]; then
+  cp -- "${CONFIG_TEMPLATE}" "${DEFAULT_CONFIG_SOURCE}"
+  chmod 0640 "${DEFAULT_CONFIG_SOURCE}"
+  if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+    chown "${SUDO_UID}:${SUDO_GID}" "${DEFAULT_CONFIG_SOURCE}"
+  fi
 
-Create it first:
-  cp "${PROJECT_DIR}/config/config.example.env" \
-     "${PROJECT_DIR}/config/config.env"
-  nano "${PROJECT_DIR}/config/config.env"
+  cat >&2 <<EOF
+Created a new configuration file from the current template:
+  ${DEFAULT_CONFIG_SOURCE}
+
+Set STUDENT_ID, STUDENT_NAME and the required connection settings, then run
+the installer again.
 EOF
   exit 1
 fi
+
+if [[ ! -r "${CONFIG_SOURCE}" ]]; then
+  echo "Configuration file not found: ${CONFIG_SOURCE}" >&2
+  exit 1
+fi
+
+merge_config_with_template() {
+  local existing_config=$1
+  local template_config=$2
+  local output_config=$3
+
+  awk '
+    NR == FNR {
+      if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+        key = $0
+        sub(/=.*/, "", key)
+        configured[key] = substr($0, index($0, "=") + 1)
+      }
+      next
+    }
+
+    {
+      if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+        key = $0
+        sub(/=.*/, "", key)
+        if (key in configured) {
+          print key "=" configured[key]
+          next
+        }
+      }
+      print
+    }
+  ' "${existing_config}" "${template_config}" > "${output_config}"
+}
+
+SOURCE_CONFIG="${CONFIG_SOURCE}"
+GENERATED_CONFIG="$(mktemp)"
+trap 'rm -f -- "${GENERATED_CONFIG:-}"' EXIT
+merge_config_with_template \
+  "${SOURCE_CONFIG}" \
+  "${CONFIG_TEMPLATE}" \
+  "${GENERATED_CONFIG}"
+CONFIG_SOURCE="${GENERATED_CONFIG}"
 
 if [[ "${INSTALL_DEPENDENCIES}" -eq 1 ]]; then
   command -v apt-get >/dev/null 2>&1 || {
@@ -162,17 +221,23 @@ STUDENT_NAME="$(read_config_value STUDENT_NAME)"
 VISION_PYTHON="$(read_config_value VISION_PYTHON /usr/bin/python3)"
 CAMERA_SOURCE="$(read_config_value CAMERA_SOURCE v4l2)"
 CAMERA_BACKEND="$(read_config_value CAMERA_BACKEND auto)"
+GUARD_DEFAULT_ENABLED="$(read_config_value GUARD_DEFAULT_ENABLED 0)"
 
 if [[ -z "${STUDENT_ID}" ||
       "${STUDENT_ID}" == "YOUR_STUDENT_ID" ||
       ! "${STUDENT_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "Set a valid STUDENT_ID in ${CONFIG_SOURCE}." >&2
+  echo "Set a valid STUDENT_ID in ${SOURCE_CONFIG}." >&2
   exit 1
 fi
 
 if [[ -z "${STUDENT_NAME}" ||
       "${STUDENT_NAME}" == "YOUR FULL NAME" ]]; then
-  echo "Set STUDENT_NAME in ${CONFIG_SOURCE}." >&2
+  echo "Set STUDENT_NAME in ${SOURCE_CONFIG}." >&2
+  exit 1
+fi
+
+if [[ ! "${GUARD_DEFAULT_ENABLED}" =~ ^[01]$ ]]; then
+  echo "GUARD_DEFAULT_ENABLED must be 0 or 1 in ${SOURCE_CONFIG}." >&2
   exit 1
 fi
 
@@ -289,6 +354,11 @@ else
   chown root:smartguard /etc/smart-guard/config.env
   chmod 0640 /etc/smart-guard/config.env
 fi
+
+rm -f -- "${GENERATED_CONFIG}"
+GENERATED_CONFIG=""
+trap - EXIT
+CONFIG_SOURCE=/etc/smart-guard/config.env
 
 for secret_path in \
   /etc/smart-guard/smtp-password \
@@ -424,7 +494,7 @@ atomic_install \
 if [[ ! -e /var/lib/smart-guard/guard-mode ]]; then
   install -o root -g smartguard -m 0660 /dev/null \
     /var/lib/smart-guard/guard-mode
-  printf '0\n' > /var/lib/smart-guard/guard-mode
+  printf '%s\n' "${GUARD_DEFAULT_ENABLED}" > /var/lib/smart-guard/guard-mode
 fi
 chown root:smartguard /var/lib/smart-guard/guard-mode
 chmod 0660 /var/lib/smart-guard/guard-mode
