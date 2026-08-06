@@ -2,7 +2,6 @@
 Description=Smart Guard Adaptive Thermal Manager
 Documentation=file:/opt/smart-guard/README.md
 Wants=network-online.target
-Requires=smart-guard-vision.service
 After=network-online.target smart-guard-vision.service
 
 [Service]
