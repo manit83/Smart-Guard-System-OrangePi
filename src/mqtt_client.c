@@ -4,6 +4,7 @@
 
 #include <mosquitto.h>
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -16,12 +17,24 @@
 #define MQTT_TOPIC_SIZE 512
 #define MQTT_STATUS_PAYLOAD_SIZE 512
 
+#ifdef CLOCK_MONOTONIC_RAW
+#define MQTT_LATENCY_CLOCK CLOCK_MONOTONIC_RAW
+#else
+#define MQTT_LATENCY_CLOCK CLOCK_MONOTONIC
+#endif
+
 struct sg_mqtt_client {
     struct mosquitto *mosquitto;
     atomic_bool connected;
     atomic_bool stopping;
     atomic_bool shutdown_acknowledged;
     atomic_int shutdown_mid;
+    pthread_mutex_t latency_lock;
+    struct timespec persons_send_time;
+    int pending_persons_mid;
+    int pending_persons_count;
+    int previous_persons_count;
+    int qos;
     char persons_topic[MQTT_TOPIC_SIZE];
     char telemetry_topic[MQTT_TOPIC_SIZE];
     char status_topic[MQTT_TOPIC_SIZE];
@@ -42,6 +55,35 @@ static void set_error(char *error, size_t size, const char *format, ...) {
     va_end(arguments);
 }
 
+static double elapsed_ms(
+    const struct timespec *end,
+    const struct timespec *start) {
+    return (end->tv_sec - start->tv_sec) * 1000.0 +
+        (end->tv_nsec - start->tv_nsec) / 1000000.0;
+}
+
+static int persons_from_payload(const char *payload) {
+    const char *position;
+    char *end = NULL;
+    long value;
+
+    if (payload == NULL) {
+        return -1;
+    }
+
+    position = strstr(payload, "\"persons\":");
+    if (position == NULL) {
+        return -1;
+    }
+
+    position += strlen("\"persons\":");
+    value = strtol(position, &end, 10);
+    if (end == position || value < 0 || value > 1000000L) {
+        return -1;
+    }
+    return (int) value;
+}
+
 static void on_connect(
     struct mosquitto *mosquitto,
     void *userdata,
@@ -57,7 +99,7 @@ static void on_connect(
                 client->status_topic,
                 (int) strlen(client->online_payload),
                 client->online_payload,
-                1,
+                client->qos,
                 true) != MOSQ_ERR_SUCCESS) {
             fprintf(stderr, "WARNING MQTT online status publish failed\n");
         }
@@ -91,10 +133,38 @@ static void on_publish(
     void *userdata,
     int message_id) {
     sg_mqtt_client_t *client = userdata;
+    struct timespec acknowledged_time;
+    double rtt_ms = -1.0;
+    int persons = 0;
     (void) mosquitto;
 
     if (message_id == atomic_load(&client->shutdown_mid)) {
         atomic_store(&client->shutdown_acknowledged, true);
+    }
+
+    pthread_mutex_lock(&client->latency_lock);
+    if (message_id == client->pending_persons_mid) {
+        if (clock_gettime(
+                MQTT_LATENCY_CLOCK,
+                &acknowledged_time) == 0) {
+            rtt_ms = elapsed_ms(
+                &acknowledged_time,
+                &client->persons_send_time);
+            persons = client->pending_persons_count;
+        }
+        client->pending_persons_mid = -1;
+    }
+    pthread_mutex_unlock(&client->latency_lock);
+
+    if (rtt_ms >= 0.0) {
+        fprintf(
+            stderr,
+            "INFO MQTT persons latency: persons=%d MID=%d "
+            "PUBACK_RTT=%.3f ms estimated_board_to_pc=%.3f ms\n",
+            persons,
+            message_id,
+            rtt_ms,
+            rtt_ms / 2.0);
     }
 }
 
@@ -112,29 +182,21 @@ static void on_log(
     }
 }
 
-static int format_topic(
+static int build_mqtt_name(
     char *buffer,
     size_t buffer_size,
+    const char *prefix,
     const char *student_id,
-    const char *leaf) {
-    int length = snprintf(
-        buffer,
-        buffer_size,
-        "home/%s/%s",
-        student_id,
-        leaf);
-    return length < 0 || (size_t) length >= buffer_size ? -1 : 0;
-}
+    const char *suffix) {
 
-static int format_alarm_topic(
-    char *buffer,
-    size_t buffer_size,
-    const char *student_id) {
     int length = snprintf(
         buffer,
         buffer_size,
-        "alarm/%s/home",
-        student_id);
+        "%s%s%s",
+        prefix,
+        student_id,
+        suffix);
+
     return length < 0 || (size_t) length >= buffer_size ? -1 : 0;
 }
 
@@ -145,8 +207,8 @@ int sg_mqtt_start(
     size_t error_size) {
     sg_mqtt_client_t *client = NULL;
     char password[MQTT_PASSWORD_SIZE];
-    char client_id[SG_TEXT_SIZE + 64];
     char will_payload[MQTT_STATUS_PAYLOAD_SIZE];
+    char client_id[MQTT_TOPIC_SIZE];
     int result;
     int length;
 
@@ -156,13 +218,16 @@ int sg_mqtt_start(
     }
     *client_out = NULL;
 
-    if (sg_read_secret(
-            config->mqtt_password_file,
-            password,
-            sizeof(password),
-            error,
-            error_size) != 0) {
-        return -1;
+    password[0] = '\0';
+    if (config->mqtt_username[0] != '\0') {
+        if (sg_read_secret(
+                config->mqtt_password_file,
+                password,
+                sizeof(password),
+                error,
+                error_size) != 0) {
+            return -1;
+        }
     }
 
     client = calloc(1, sizeof(*client));
@@ -171,29 +236,55 @@ int sg_mqtt_start(
         set_error(error, error_size, "cannot allocate MQTT client");
         return -1;
     }
-
-    if (format_topic(
-            client->persons_topic,
-            sizeof(client->persons_topic),
-            config->student_id,
-            "persons") != 0 ||
-        format_topic(
-            client->telemetry_topic,
-            sizeof(client->telemetry_topic),
-            config->student_id,
-            "telemetry") != 0 ||
-        format_topic(
-            client->status_topic,
-            sizeof(client->status_topic),
-            config->student_id,
-            "status") != 0 ||
-        format_alarm_topic(
-            client->alarm_topic,
-            sizeof(client->alarm_topic),
-            config->student_id) != 0) {
-        set_error(error, error_size, "MQTT topic is too long");
-        goto fail;
+    if (pthread_mutex_init(&client->latency_lock, NULL) != 0) {
+        memset(password, 0, sizeof(password));
+        set_error(error, error_size, "cannot initialize MQTT latency lock");
+        free(client);
+        return -1;
     }
+    client->pending_persons_mid = -1;
+    client->previous_persons_count = 0;
+
+    if (build_mqtt_name(
+        client->persons_topic,
+        sizeof(client->persons_topic),
+        "home/",
+        config->student_id,
+        "/persons") != 0 ||
+
+    build_mqtt_name(
+        client->telemetry_topic,
+        sizeof(client->telemetry_topic),
+        "home/",
+        config->student_id,
+        "/telemetry") != 0 ||
+
+    build_mqtt_name(
+        client->status_topic,
+        sizeof(client->status_topic),
+        "home/",
+        config->student_id,
+        "/status") != 0 ||
+
+    build_mqtt_name(
+        client->alarm_topic,
+        sizeof(client->alarm_topic),
+        "home/",
+        config->student_id,
+        "/alarm") != 0 ||
+
+    build_mqtt_name(
+        client_id,
+        sizeof(client_id),
+        "smart-guard-",
+        config->student_id,
+        "") != 0) {
+
+    set_error(error, error_size, "MQTT topic or client ID is too long");
+    goto fail;
+}
+
+client->qos = 1;
 
     length = snprintf(
         will_payload,
@@ -228,17 +319,6 @@ int sg_mqtt_start(
         goto fail;
     }
 
-    length = snprintf(
-        client_id,
-        sizeof(client_id),
-        "smart-guard-%s-%ld",
-        config->student_id,
-        (long) getpid());
-    if (length < 0 || (size_t) length >= sizeof(client_id)) {
-        set_error(error, error_size, "MQTT client ID is too long");
-        goto fail;
-    }
-
     result = mosquitto_lib_init();
     if (result != MOSQ_ERR_SUCCESS) {
         set_error(
@@ -249,7 +329,8 @@ int sg_mqtt_start(
         goto fail;
     }
 
-    client->mosquitto = mosquitto_new(client_id, true, client);
+    client->mosquitto =
+        mosquitto_new(client_id, true, client);
     if (client->mosquitto == NULL) {
         set_error(error, error_size, "cannot create MQTT client");
         mosquitto_lib_cleanup();
@@ -279,26 +360,29 @@ int sg_mqtt_start(
         goto fail_library;
     }
 
-    result = mosquitto_username_pw_set(
-        client->mosquitto,
-        config->mqtt_username,
-        password);
-    memset(password, 0, sizeof(password));
-    if (result != MOSQ_ERR_SUCCESS) {
-        set_error(
-            error,
-            error_size,
-            "cannot configure MQTT credentials: %s",
-            mosquitto_strerror(result));
-        goto fail_library;
+    if (config->mqtt_username[0] != '\0') {
+        result = mosquitto_username_pw_set(
+            client->mosquitto,
+            config->mqtt_username,
+            password);
+        memset(password, 0, sizeof(password));
+        if (result != MOSQ_ERR_SUCCESS) {
+            set_error(
+                error,
+                error_size,
+                "cannot configure MQTT credentials: %s",
+                mosquitto_strerror(result));
+            goto fail_library;
+        }
     }
+    memset(password, 0, sizeof(password));
 
     result = mosquitto_will_set(
         client->mosquitto,
         client->status_topic,
         (int) strlen(will_payload),
         will_payload,
-        1,
+        client->qos,
         true);
     if (result != MOSQ_ERR_SUCCESS) {
         set_error(
@@ -354,6 +438,7 @@ fail_library:
     mosquitto_lib_cleanup();
 fail:
     memset(password, 0, sizeof(password));
+    pthread_mutex_destroy(&client->latency_lock);
     free(client);
     return -1;
 }
@@ -362,13 +447,17 @@ bool sg_mqtt_is_connected(const sg_mqtt_client_t *client) {
     return client != NULL && atomic_load(&client->connected);
 }
 
-static int publish_qos1(
+static int publish_message(
     sg_mqtt_client_t *client,
     const char *topic,
     const char *payload,
     char *error,
     size_t error_size) {
     int result;
+    bool is_persons_message;
+    bool measure_latency = false;
+    int message_id = 0;
+    int persons = -1;
 
     if (client == NULL || payload == NULL) {
         set_error(error, error_size, "MQTT publish input is null");
@@ -379,19 +468,58 @@ static int publish_qos1(
         return 1;
     }
 
-    result = mosquitto_publish(
-        client->mosquitto,
-        NULL,
-        topic,
-        (int) strlen(payload),
-        payload,
-        1,
-        false);
+    is_persons_message = strcmp(topic, client->persons_topic) == 0;
+    if (is_persons_message) {
+        persons = persons_from_payload(payload);
+        pthread_mutex_lock(&client->latency_lock);
+        measure_latency =
+            client->qos == 1 &&
+            persons > 0 &&
+            persons > client->previous_persons_count &&
+            client->pending_persons_mid == -1;
+
+        if (measure_latency &&
+            clock_gettime(
+                MQTT_LATENCY_CLOCK,
+                &client->persons_send_time) != 0) {
+            measure_latency = false;
+        }
+
+        result = mosquitto_publish(
+            client->mosquitto,
+            measure_latency ? &message_id : NULL,
+            topic,
+            (int) strlen(payload),
+            payload,
+            client->qos,
+            false);
+
+        if (result == MOSQ_ERR_SUCCESS) {
+            if (persons >= 0) {
+                client->previous_persons_count = persons;
+            }
+            if (measure_latency) {
+                client->pending_persons_mid = message_id;
+                client->pending_persons_count = persons;
+            }
+        }
+        pthread_mutex_unlock(&client->latency_lock);
+    } else {
+        result = mosquitto_publish(
+            client->mosquitto,
+            NULL,
+            topic,
+            (int) strlen(payload),
+            payload,
+            client->qos,
+            false);
+    }
     if (result != MOSQ_ERR_SUCCESS) {
         set_error(
             error,
             error_size,
-            "MQTT QoS 1 publish failed: %s",
+            "MQTT QoS %d publish failed: %s",
+            client->qos,
             mosquitto_strerror(result));
         return -1;
     }
@@ -403,7 +531,7 @@ int sg_mqtt_publish_persons(
     const char *payload,
     char *error,
     size_t error_size) {
-    return publish_qos1(
+    return publish_message(
         client,
         client == NULL ? "" : client->persons_topic,
         payload,
@@ -416,7 +544,7 @@ int sg_mqtt_publish_telemetry(
     const char *payload,
     char *error,
     size_t error_size) {
-    return publish_qos1(
+    return publish_message(
         client,
         client == NULL ? "" : client->telemetry_topic,
         payload,
@@ -429,7 +557,7 @@ int sg_mqtt_publish_alarm(
     const char *payload,
     char *error,
     size_t error_size) {
-    return publish_qos1(
+    return publish_message(
         client,
         client == NULL ? "" : client->alarm_topic,
         payload,
@@ -452,7 +580,7 @@ void sg_mqtt_stop(sg_mqtt_client_t *client) {
                 client->status_topic,
                 (int) strlen(client->graceful_offline_payload),
                 client->graceful_offline_payload,
-                1,
+                client->qos,
                 true);
 
             if (result == MOSQ_ERR_SUCCESS) {
@@ -474,5 +602,6 @@ void sg_mqtt_stop(sg_mqtt_client_t *client) {
         mosquitto_destroy(client->mosquitto);
     }
     mosquitto_lib_cleanup();
+    pthread_mutex_destroy(&client->latency_lock);
     free(client);
 }
