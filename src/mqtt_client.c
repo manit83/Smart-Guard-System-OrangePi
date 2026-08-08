@@ -4,7 +4,8 @@
 
 #include <mosquitto.h>
 
-#include <pthread.h>
+#include <ctype.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -16,12 +17,7 @@
 #define MQTT_PASSWORD_SIZE 512
 #define MQTT_TOPIC_SIZE 512
 #define MQTT_STATUS_PAYLOAD_SIZE 512
-
-#ifdef CLOCK_MONOTONIC_RAW
-#define MQTT_LATENCY_CLOCK CLOCK_MONOTONIC_RAW
-#else
-#define MQTT_LATENCY_CLOCK CLOCK_MONOTONIC
-#endif
+#define MQTT_TIMESTAMPED_PAYLOAD_SIZE (SG_PAYLOAD_SIZE + 64)
 
 struct sg_mqtt_client {
     struct mosquitto *mosquitto;
@@ -29,10 +25,6 @@ struct sg_mqtt_client {
     atomic_bool stopping;
     atomic_bool shutdown_acknowledged;
     atomic_int shutdown_mid;
-    pthread_mutex_t latency_lock;
-    struct timespec persons_send_time;
-    int pending_persons_mid;
-    int pending_persons_count;
     int previous_persons_count;
     int qos;
     char persons_topic[MQTT_TOPIC_SIZE];
@@ -55,13 +47,6 @@ static void set_error(char *error, size_t size, const char *format, ...) {
     va_end(arguments);
 }
 
-static double elapsed_ms(
-    const struct timespec *end,
-    const struct timespec *start) {
-    return (end->tv_sec - start->tv_sec) * 1000.0 +
-        (end->tv_nsec - start->tv_nsec) / 1000000.0;
-}
-
 static int persons_from_payload(const char *payload) {
     const char *position;
     char *end = NULL;
@@ -82,6 +67,78 @@ static int persons_from_payload(const char *payload) {
         return -1;
     }
     return (int) value;
+}
+
+static int realtime_ms(int64_t *timestamp_ms) {
+    struct timespec now;
+
+    if (timestamp_ms == NULL ||
+        clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        return -1;
+    }
+
+    *timestamp_ms =
+        (int64_t) now.tv_sec * 1000LL +
+        (int64_t) now.tv_nsec / 1000000LL;
+    return 0;
+}
+
+static int add_sent_timestamp(
+    const char *payload,
+    int64_t sent_at_ms,
+    char *timestamped_payload,
+    size_t timestamped_payload_size) {
+    size_t length;
+    size_t object_start = 0;
+    size_t object_end;
+    size_t position;
+    bool has_members = false;
+    int written;
+
+    if (payload == NULL || timestamped_payload == NULL ||
+        timestamped_payload_size == 0) {
+        return -1;
+    }
+
+    length = strlen(payload);
+    while (object_start < length &&
+           isspace((unsigned char) payload[object_start])) {
+        object_start++;
+    }
+
+    object_end = length;
+    while (object_end > object_start &&
+           isspace((unsigned char) payload[object_end - 1])) {
+        object_end--;
+    }
+
+    if (object_end <= object_start + 1 ||
+        payload[object_start] != '{' ||
+        payload[object_end - 1] != '}') {
+        return -1;
+    }
+
+    for (position = object_start + 1;
+         position < object_end - 1;
+         position++) {
+        if (!isspace((unsigned char) payload[position])) {
+            has_members = true;
+            break;
+        }
+    }
+
+    written = snprintf(
+        timestamped_payload,
+        timestamped_payload_size,
+        "%.*s%s\"sent_at_ms\":%lld}%s",
+        (int) (object_end - 1),
+        payload,
+        has_members ? "," : "",
+        (long long) sent_at_ms,
+        payload + object_end);
+
+    return written < 0 ||
+        (size_t) written >= timestamped_payload_size ? -1 : 0;
 }
 
 static void on_connect(
@@ -133,38 +190,10 @@ static void on_publish(
     void *userdata,
     int message_id) {
     sg_mqtt_client_t *client = userdata;
-    struct timespec acknowledged_time;
-    double rtt_ms = -1.0;
-    int persons = 0;
     (void) mosquitto;
 
     if (message_id == atomic_load(&client->shutdown_mid)) {
         atomic_store(&client->shutdown_acknowledged, true);
-    }
-
-    pthread_mutex_lock(&client->latency_lock);
-    if (message_id == client->pending_persons_mid) {
-        if (clock_gettime(
-                MQTT_LATENCY_CLOCK,
-                &acknowledged_time) == 0) {
-            rtt_ms = elapsed_ms(
-                &acknowledged_time,
-                &client->persons_send_time);
-            persons = client->pending_persons_count;
-        }
-        client->pending_persons_mid = -1;
-    }
-    pthread_mutex_unlock(&client->latency_lock);
-
-    if (rtt_ms >= 0.0) {
-        fprintf(
-            stderr,
-            "INFO MQTT persons latency: persons=%d MID=%d "
-            "PUBACK_RTT=%.3f ms estimated_board_to_pc=%.3f ms\n",
-            persons,
-            message_id,
-            rtt_ms,
-            rtt_ms / 2.0);
     }
 }
 
@@ -188,7 +217,6 @@ static int build_mqtt_name(
     const char *prefix,
     const char *student_id,
     const char *suffix) {
-
     int length = snprintf(
         buffer,
         buffer_size,
@@ -196,7 +224,6 @@ static int build_mqtt_name(
         prefix,
         student_id,
         suffix);
-
     return length < 0 || (size_t) length >= buffer_size ? -1 : 0;
 }
 
@@ -236,55 +263,42 @@ int sg_mqtt_start(
         set_error(error, error_size, "cannot allocate MQTT client");
         return -1;
     }
-    if (pthread_mutex_init(&client->latency_lock, NULL) != 0) {
-        memset(password, 0, sizeof(password));
-        set_error(error, error_size, "cannot initialize MQTT latency lock");
-        free(client);
-        return -1;
-    }
-    client->pending_persons_mid = -1;
     client->previous_persons_count = 0;
 
     if (build_mqtt_name(
-        client->persons_topic,
-        sizeof(client->persons_topic),
-        "home/",
-        config->student_id,
-        "/persons") != 0 ||
-
-    build_mqtt_name(
-        client->telemetry_topic,
-        sizeof(client->telemetry_topic),
-        "home/",
-        config->student_id,
-        "/telemetry") != 0 ||
-
-    build_mqtt_name(
-        client->status_topic,
-        sizeof(client->status_topic),
-        "home/",
-        config->student_id,
-        "/status") != 0 ||
-
-    build_mqtt_name(
-        client->alarm_topic,
-        sizeof(client->alarm_topic),
-        "home/",
-        config->student_id,
-        "/alarm") != 0 ||
-
-    build_mqtt_name(
-        client_id,
-        sizeof(client_id),
-        "smart-guard-",
-        config->student_id,
-        "") != 0) {
-
-    set_error(error, error_size, "MQTT topic or client ID is too long");
-    goto fail;
-}
-
-client->qos = 1;
+            client->persons_topic,
+            sizeof(client->persons_topic),
+            "home/",
+            config->student_id,
+            "/persons") != 0 ||
+        build_mqtt_name(
+            client->telemetry_topic,
+            sizeof(client->telemetry_topic),
+            "home/",
+            config->student_id,
+            "/telemetry") != 0 ||
+        build_mqtt_name(
+            client->status_topic,
+            sizeof(client->status_topic),
+            "home/",
+            config->student_id,
+            "/status") != 0 ||
+        build_mqtt_name(
+            client->alarm_topic,
+            sizeof(client->alarm_topic),
+            "home/",
+            config->student_id,
+            "/alarm") != 0 ||
+        build_mqtt_name(
+            client_id,
+            sizeof(client_id),
+            "smart-guard-",
+            config->student_id,
+            "") != 0) {
+        set_error(error, error_size, "MQTT topic or client ID is too long");
+        goto fail;
+    }
+    client->qos = 1;
 
     length = snprintf(
         will_payload,
@@ -438,7 +452,6 @@ fail_library:
     mosquitto_lib_cleanup();
 fail:
     memset(password, 0, sizeof(password));
-    pthread_mutex_destroy(&client->latency_lock);
     free(client);
     return -1;
 }
@@ -455,9 +468,11 @@ static int publish_message(
     size_t error_size) {
     int result;
     bool is_persons_message;
-    bool measure_latency = false;
-    int message_id = 0;
+    bool add_timestamp = false;
     int persons = -1;
+    int64_t sent_at_ms = 0;
+    char timestamped_payload[MQTT_TIMESTAMPED_PAYLOAD_SIZE];
+    const char *published_payload = payload;
 
     if (client == NULL || payload == NULL) {
         set_error(error, error_size, "MQTT publish input is null");
@@ -471,26 +486,38 @@ static int publish_message(
     is_persons_message = strcmp(topic, client->persons_topic) == 0;
     if (is_persons_message) {
         persons = persons_from_payload(payload);
-        pthread_mutex_lock(&client->latency_lock);
-        measure_latency =
-            client->qos == 1 &&
+        add_timestamp =
             persons > 0 &&
-            persons > client->previous_persons_count &&
-            client->pending_persons_mid == -1;
+            persons > client->previous_persons_count;
 
-        if (measure_latency &&
-            clock_gettime(
-                MQTT_LATENCY_CLOCK,
-                &client->persons_send_time) != 0) {
-            measure_latency = false;
+        if (add_timestamp) {
+            if (realtime_ms(&sent_at_ms) != 0) {
+                set_error(
+                    error,
+                    error_size,
+                    "cannot read CLOCK_REALTIME for MQTT persons message");
+                return -1;
+            }
+            if (add_sent_timestamp(
+                    payload,
+                    sent_at_ms,
+                    timestamped_payload,
+                    sizeof(timestamped_payload)) != 0) {
+                set_error(
+                    error,
+                    error_size,
+                    "cannot add sent_at_ms to MQTT persons JSON payload");
+                return -1;
+            }
+            published_payload = timestamped_payload;
         }
 
         result = mosquitto_publish(
             client->mosquitto,
-            measure_latency ? &message_id : NULL,
+            NULL,
             topic,
-            (int) strlen(payload),
-            payload,
+            (int) strlen(published_payload),
+            published_payload,
             client->qos,
             false);
 
@@ -498,12 +525,15 @@ static int publish_message(
             if (persons >= 0) {
                 client->previous_persons_count = persons;
             }
-            if (measure_latency) {
-                client->pending_persons_mid = message_id;
-                client->pending_persons_count = persons;
+            if (add_timestamp) {
+                fprintf(
+                    stderr,
+                    "INFO MQTT persons timestamp: persons=%d "
+                    "sent_at_ms=%lld\n",
+                    persons,
+                    (long long) sent_at_ms);
             }
         }
-        pthread_mutex_unlock(&client->latency_lock);
     } else {
         result = mosquitto_publish(
             client->mosquitto,
@@ -602,6 +632,5 @@ void sg_mqtt_stop(sg_mqtt_client_t *client) {
         mosquitto_destroy(client->mosquitto);
     }
     mosquitto_lib_cleanup();
-    pthread_mutex_destroy(&client->latency_lock);
     free(client);
 }
